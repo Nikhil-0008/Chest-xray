@@ -1,0 +1,2370 @@
+import gradio as gr
+import numpy as np
+import cv2
+from PIL import Image, ImageDraw, ImageFont
+import tensorflow as tf
+from tensorflow.keras.applications.densenet import preprocess_input
+import os, traceback, json, requests, datetime, base64, io, re, uuid
+from supabase import create_client, Client
+
+MODEL_PATH = os.environ.get(
+    "CHESTSCAN_MODEL_PATH",
+    r"Paste your Path",
+)
+CLASS_NAMES = ["NORMAL", "PNEUMONIA"]
+NORMAL_IDX = 0
+PNEUMO_IDX = 1
+
+GRADCAM_LAYER = "conv5_block16_concat"
+INPUT_SIZE = 224
+
+# NOTE: these keys were hardcoded in the original file. They now live behind
+# os.environ.get() with the original values kept as fallback defaults so the
+# app keeps working out of the box — but because these values have already
+# been shared in plain text, you should treat them as compromised: rotate
+# both the OpenRouter key and the Supabase secret key, then set
+# OPENROUTER_API_KEY / SUPABASE_KEY as real environment variables instead of
+# relying on the fallback.
+OPENROUTER_API_KEY = os.environ.get(
+    "OPENROUTER_API_KEY",
+    "Paste your api key",
+)
+OPENROUTER_MODEL = "openai/gpt-4o-mini"
+OPENROUTER_VISION_MODEL = "openai/gpt-4o-mini"
+OPENROUTER_URL = "https://openrouter.ai/api/v1/chat/completions"
+SUPABASE_URL = os.environ.get(
+    "SUPABASE_URL", "https://eorqoyzghbpdpfyycqfp.supabase.co"
+)
+SUPABASE_KEY = os.environ.get(
+    "SUPABASE_KEY", "add yours"
+)
+
+if SUPABASE_KEY in ("", "PASTE_YOUR_SUPABASE_SECRET_KEY_HERE"):
+    raise RuntimeError(
+        "SUPABASE_KEY is still a placeholder. Open this file and replace "
+        "SUPABASE_KEY with your actual Supabase secret/service key "
+        "(not the anon key)."
+    )
+
+supabase: Client = create_client(SUPABASE_URL, SUPABASE_KEY)
+
+ORIGINAL_BUCKET = "original-xrays"
+GRADCAM_BUCKET = "gradcam-results"
+
+print("[ChestScan] Supabase client created.")
+
+TEAL = "#2dd8c8"
+ALERT_RED = "#ff5d6c"
+SAFE_GREEN = "#3ddc84"
+INK = "#0a1420"
+PANEL = "#0f1b2b"
+LINE = "#1c2c3f"
+FINDING_COLOR_RGB = (255, 93, 108)
+
+print("\n[ChestScan] Loading model …")
+
+if not os.path.exists(MODEL_PATH):
+    raise FileNotFoundError(
+        f"Model file not found at:\n  {MODEL_PATH}\n"
+        "Set the CHESTSCAN_MODEL_PATH environment variable to point at "
+        "your densenet121.h5 file, or edit MODEL_PATH at the top of this file."
+    )
+
+model = tf.keras.models.load_model(MODEL_PATH)
+print(f"[ChestScan] Ready | input={model.input_shape} output={model.output_shape}")
+
+try:
+    _in_h, _in_w = model.input_shape[1], model.input_shape[2]
+    if _in_h and _in_w:
+        INPUT_SIZE = int(_in_h)
+        if _in_h != _in_w:
+            print(
+                f"[ChestScan] WARNING: non-square input {_in_h}x{_in_w} detected."
+            )
+        print(f"[ChestScan] Auto-detected input resolution: {INPUT_SIZE}x{INPUT_SIZE}")
+except Exception:
+    print(f"[ChestScan] Could not auto-detect input size; using {INPUT_SIZE}x{INPUT_SIZE}.")
+
+NUM_OUTPUT_UNITS = model.output_shape[-1]
+IS_SIGMOID_BINARY = (NUM_OUTPUT_UNITS == 1)
+
+print(
+    f"[ChestScan] Output units: {NUM_OUTPUT_UNITS} "
+    f"({'single sigmoid' if IS_SIGMOID_BINARY else 'softmax'})"
+)
+
+def _resolve_gradcam_layer(model, preferred_name):
+    try:
+        return model.get_layer(preferred_name).name
+    except ValueError:
+        print(
+            f"[ChestScan] WARNING: layer '{preferred_name}' not found — "
+            "searching for last 4D conv-like layer."
+        )
+        for layer in reversed(model.layers):
+            try:
+                shape = layer.output_shape
+            except Exception:
+                continue
+            if isinstance(shape, tuple) and len(shape) == 4:
+                print(f"[ChestScan] Auto-selected Grad-CAM layer: '{layer.name}'")
+                return layer.name
+        raise ValueError(
+            "Could not find any 4D convolutional layer for Grad-CAM."
+        )
+
+GRADCAM_LAYER = _resolve_gradcam_layer(model, GRADCAM_LAYER)
+
+gradcam_model = tf.keras.models.Model(
+    inputs=model.inputs,
+    outputs=[model.get_layer(GRADCAM_LAYER).output, model.output]
+)
+
+print(f"[ChestScan] Grad-CAM layer: '{GRADCAM_LAYER}'")
+
+
+# ─────────────────────────────────────────────────────────────
+# EMERGENCY TRIAGE PRIORITY SYSTEM
+# ─────────────────────────────────────────────────────────────
+# This block implements the triage ordering hierarchy:
+#   1. Emergency level (CRITICAL > HIGH > MODERATE > LOW)
+#   2. Clinical severity indicators (SpO2 / RR / HR — only if provided)
+#   3. Deterioration trend (WORSENING > STABLE/UNKNOWN > IMPROVING)
+#   4. Waiting time (longer wait = higher priority)
+#   5. FIFO on registration timestamp as the final tie-breaker
+#
+# Patient name and UID are NEVER used as a priority input — only as labels.
+# Missing vitals are excluded from the score, never assumed/fabricated.
+
+TRIAGE_DISCLAIMER = (
+    "⚠ Triage priority is decision support only. Clinical staff must make "
+    "the final prioritization decision."
+)
+
+EMERGENCY_LEVELS = ["CRITICAL", "HIGH", "MODERATE", "LOW"]
+LEVEL_RANK = {"CRITICAL": 4, "HIGH": 3, "MODERATE": 2, "LOW": 1}
+LEVEL_COLOR = {
+    "CRITICAL": "#ff3b4e",
+    "HIGH": "#ff9d3d",
+    "MODERATE": "#ffd23d",
+    "LOW": "#3ddc84",
+}
+LEVEL_EMOJI = {"CRITICAL": "🔴", "HIGH": "🟠", "MODERATE": "🟡", "LOW": "🟢"}
+
+TREND_CHOICES = ["WORSENING", "STABLE", "IMPROVING", "UNKNOWN"]
+TREND_RANK = {"WORSENING": 2, "STABLE": 1, "UNKNOWN": 1, "IMPROVING": 0}
+TREND_EMOJI = {"WORSENING": "📉", "STABLE": "➖", "IMPROVING": "📈", "UNKNOWN": "❔"}
+
+DETERIORATION_DROPDOWN_CHOICES = ["Auto-detect"] + TREND_CHOICES
+
+
+def _opt_float(value):
+    """Best-effort optional float parse. Returns None for blank/invalid —
+    never fabricates a value."""
+    if value is None:
+        return None
+    try:
+        s = str(value).strip()
+        if s == "":
+            return None
+        return float(value)
+    except Exception:
+        return None
+
+
+def compute_severity_score(spo2, rr, hr):
+    """Combines only the vitals that are actually available into a single
+    non-negative severity score (higher = more urgent). Returns None only
+    if NO vitals were provided at all, so callers can distinguish "no data"
+    from "normal vitals" instead of inventing a neutral value.
+
+    IMPORTANT: presence of a vital is tracked independently from whether it
+    contributes to the score. A normal SpO2/RR/HR contributes 0 but still
+    counts as "data was provided" — it must NOT be treated the same as
+    "nothing was entered", otherwise downstream code falls back to
+    confidence-only scoring and can suggest HIGH/CRITICAL even when the
+    entered vitals are perfectly normal.
+    """
+    spo2 = _opt_float(spo2)
+    rr = _opt_float(rr)
+    hr = _opt_float(hr)
+
+    if spo2 is None and rr is None and hr is None:
+        return None
+
+    score = 0.0
+
+    if spo2 is not None:
+        score += max(0.0, 95.0 - spo2) * 3.0
+
+    if rr is not None:
+        if rr > 20:
+            score += (rr - 20) * 2.0
+        elif rr < 12:
+            score += (12 - rr) * 2.0
+
+    if hr is not None:
+        if hr > 100:
+            score += (hr - 100) * 1.0
+        elif hr < 60:
+            score += (60 - hr) * 1.0
+
+    return round(score, 2)
+
+
+def determine_deterioration(current, previous):
+    """Compares the current visit's vitals against the most recent prior
+    visit for the same patient_id. Only compares fields present on BOTH
+    records; if nothing overlaps, returns UNKNOWN rather than guessing."""
+    if not previous:
+        return "UNKNOWN"
+
+    worse = 0
+    better = 0
+    compared = 0
+
+    def _cmp(cur, prev, higher_is_worse, threshold):
+        nonlocal worse, better, compared
+        cur = _opt_float(cur)
+        prev = _opt_float(prev)
+        if cur is None or prev is None:
+            return
+        compared += 1
+        diff = cur - prev
+        if higher_is_worse:
+            if diff > threshold:
+                worse += 1
+            elif diff < -threshold:
+                better += 1
+        else:
+            if diff < -threshold:
+                worse += 1
+            elif diff > threshold:
+                better += 1
+
+    _cmp(current.get("spo2"), previous.get("spo2"), higher_is_worse=False, threshold=1.5)
+    _cmp(current.get("rr"), previous.get("rr"), higher_is_worse=True, threshold=2)
+    _cmp(current.get("hr"), previous.get("hr"), higher_is_worse=True, threshold=8)
+
+    if compared == 0:
+        return "UNKNOWN"
+    if worse > 0 and worse >= better:
+        return "WORSENING"
+    if better > 0 and better > worse:
+        return "IMPROVING"
+    return "STABLE"
+
+
+def suggest_emergency_level(label, confidence, severity_score):
+    """A starting suggestion only — always shown as editable in the UI so a
+    clinician can override it.
+
+    Vitals drive this, not model confidence. A high-confidence PNEUMONIA
+    call with normal vitals should land at MODERATE, not HIGH/CRITICAL —
+    confidence describes how sure the model is about the finding, not how
+    urgent the patient's condition is. Confidence only nudges the level
+    when there are NO vitals to go on yet."""
+    if label != "PNEUMONIA":
+        return "LOW"
+
+    if severity_score is None:
+        # No vitals entered yet — fall back to confidence only, and never
+        # suggest CRITICAL on imaging confidence alone.
+        return "HIGH" if (confidence or 0) >= 95 else "MODERATE"
+
+    if severity_score >= 25:
+        return "CRITICAL"
+    if severity_score >= 12:
+        return "HIGH"
+    # severity_score is 0 (vitals entered and all within normal range) or a
+    # small positive value — either way this is a confirmed finding that
+    # deserves attention but isn't in vital-sign distress.
+    return "MODERATE"
+
+
+def _parse_ts(value):
+    if not value:
+        return datetime.datetime.now(datetime.timezone.utc)
+    try:
+        s = str(value).replace("Z", "+00:00")
+        ts = datetime.datetime.fromisoformat(s)
+        if ts.tzinfo is None:
+            ts = ts.replace(tzinfo=datetime.timezone.utc)
+        return ts
+    except Exception:
+        return datetime.datetime.now(datetime.timezone.utc)
+
+
+def compute_priority_key(rec):
+    """Sort key implementing the full triage hierarchy. Sorting a list of
+    records ascending by this key puts the highest-priority patient first.
+    Name and UID never enter this calculation."""
+    level = rec.get("emergency_level") or "LOW"
+    level_rank = LEVEL_RANK.get(level, 1)
+
+    severity = compute_severity_score(
+        rec.get("spo2"), rec.get("respiratory_rate"), rec.get("heart_rate")
+    )
+    severity_val = severity if severity is not None else 0.0
+
+    trend = rec.get("deterioration_status") or "UNKNOWN"
+    trend_rank = TREND_RANK.get(trend, 1)
+
+    ts = _parse_ts(rec.get("waiting_since") or rec.get("created_at"))
+    now = datetime.datetime.now(datetime.timezone.utc)
+    waiting_seconds = max(0.0, (now - ts).total_seconds())
+
+    # Descending on level/severity/trend/waiting, then FIFO ascending on the
+    # raw timestamp as the absolute final tie-breaker.
+    return (-level_rank, -severity_val, -trend_rank, -waiting_seconds, ts.timestamp())
+
+
+def fetch_previous_vitals(patient_id):
+    """Looks up the most recent prior scan for this patient_id (used purely
+    for trend detection). Returns None if no patient_id was given or none
+    is found — never invents history."""
+    if not patient_id or not str(patient_id).strip():
+        return None
+    try:
+        result = (
+            supabase.table("patient_scans")
+            .select("spo2,respiratory_rate,heart_rate,created_at")
+            .eq("patient_id", str(patient_id).strip())
+            .order("created_at", desc=True)
+            .limit(1)
+            .execute()
+        )
+        rows = result.data or []
+        if not rows:
+            return None
+        r = rows[0]
+        return {"spo2": r.get("spo2"), "rr": r.get("respiratory_rate"), "hr": r.get("heart_rate")}
+    except Exception as e:
+        print(f"[ChestScan] Could not fetch previous vitals: {e}")
+        return None
+
+
+def recalc_suggestion(state, spo2, rr, hr, patient_id):
+    label = state.get("label") if state else "NORMAL"
+    confidence = state.get("confidence") if state else 0
+
+    severity = compute_severity_score(spo2, rr, hr)
+    suggested_level = suggest_emergency_level(label, confidence, severity)
+
+    trend = "UNKNOWN"
+    has_current = any(_opt_float(v) is not None for v in (spo2, rr, hr))
+    if patient_id and has_current:
+        previous = fetch_previous_vitals(patient_id)
+        trend = determine_deterioration({"spo2": spo2, "rr": rr, "hr": hr}, previous)
+
+    trend_dropdown_value = trend if trend != "UNKNOWN" else "Auto-detect"
+    return gr.update(value=suggested_level), gr.update(value=trend_dropdown_value)
+
+
+# PREPROCESSING
+def preprocess(pil_img: Image.Image) -> np.ndarray:
+    rgb = np.array(pil_img.convert("RGB"))
+    rgb = cv2.resize(rgb, (INPUT_SIZE, INPUT_SIZE)).astype(np.float32)
+    arr = preprocess_input(rgb)
+    return np.expand_dims(arr, axis=0)
+
+
+# CHEST X-RAY VALIDATION
+def validate_chest_xray(pil_img: Image.Image):
+    if not OPENROUTER_API_KEY:
+        msg = (
+            "No OPENROUTER_API_KEY is set, so image validation cannot run. "
+            "Set the environment variable and restart the app."
+        )
+        print(f"[ChestScan] GATE BLOCKED: {msg}")
+        return False, msg
+
+    buf = io.BytesIO()
+    pil_img.convert("RGB").save(buf, format="JPEG", quality=88)
+    b64 = base64.b64encode(buf.getvalue()).decode("utf-8")
+
+    payload = {
+        "model": OPENROUTER_VISION_MODEL,
+        "messages": [
+            {
+                "role": "system",
+                "content": (
+                    "You are a strict image-type gatekeeper for a medical imaging "
+                    "tool. You only ever respond with compact JSON, nothing else."
+                ),
+            },
+            {
+                "role": "user",
+                "content": [
+                    {
+                        "type": "text",
+                        "text": (
+                            "Is this image an actual clinical chest X-ray (radiograph)? "
+                            "It must specifically be a chest X-ray — reject brain MRI/CT "
+                            "scans, other body-part X-rays, other medical images, "
+                            "illustrations, and ordinary photos. "
+                            'Respond ONLY with JSON in exactly this shape: '
+                            '{"is_chest_xray": true or false, "reason": "<one short sentence>"}'
+                        ),
+                    },
+                    {
+                        "type": "image_url",
+                        "image_url": {"url": f"data:image/jpeg;base64,{b64}"},
+                    },
+                ],
+            },
+        ],
+        "temperature": 0,
+        "max_tokens": 120,
+    }
+
+    try:
+        resp = requests.post(
+            OPENROUTER_URL,
+            headers={
+                "Authorization": f"Bearer {OPENROUTER_API_KEY}",
+                "Content-Type": "application/json",
+            },
+            data=json.dumps(payload),
+            timeout=30,
+        )
+    except Exception as e:
+        msg = f"Network error reaching OpenRouter: {e}"
+        print(f"[ChestScan] GATE BLOCKED: {msg}")
+        return False, msg
+
+    if resp.status_code != 200:
+        print(
+            f"[ChestScan] GATE BLOCKED: OpenRouter returned HTTP "
+            f"{resp.status_code}: {resp.text[:300]}"
+        )
+        return False, (
+            "Could not verify this is a chest X-ray "
+            f"(API error {resp.status_code} — check your OPENROUTER_API_KEY)."
+        )
+
+    try:
+        raw_content = resp.json()["choices"][0]["message"]["content"].strip()
+    except Exception as e:
+        print(f"[ChestScan] Unexpected API response shape: {e}")
+        return False, "Could not verify this is a chest X-ray (unexpected API response)."
+
+    match = re.search(r"\{.*\}", raw_content, re.DOTALL)
+    if not match:
+        print(f"[ChestScan] GATE BLOCKED: no JSON found: '{raw_content}'")
+        return False, "Could not verify this is a chest X-ray (unparseable response)."
+
+    try:
+        parsed = json.loads(match.group(0))
+    except Exception as e:
+        print(f"[ChestScan] GATE BLOCKED: JSON parse error: {e}")
+        return False, "Could not verify this is a chest X-ray (unparseable response)."
+
+    is_valid = bool(parsed.get("is_chest_xray", False))
+    reason = str(parsed.get("reason", "")).strip()
+
+    print(
+        f"[ChestScan] Vision gate → is_chest_xray={is_valid} reason='{reason}'"
+    )
+    return is_valid, reason
+
+
+# GRAD-CAM
+
+def compute_gradcam(tensor: np.ndarray, class_idx: int) -> np.ndarray:
+    with tf.GradientTape() as tape:
+        conv_outputs, predictions = gradcam_model(
+            tf.cast(tensor, tf.float32), training=False
+        )
+        tape.watch(conv_outputs)
+        class_channel = predictions[:, class_idx]
+
+    grads = tape.gradient(class_channel, conv_outputs)
+    pooled_grads = tf.reduce_mean(grads, axis=(0, 1, 2))
+    conv_out = conv_outputs[0]
+
+    heatmap = conv_out @ pooled_grads[..., tf.newaxis]
+    heatmap = tf.squeeze(heatmap)
+    heatmap = tf.maximum(heatmap, 0)
+    heatmap = heatmap / (tf.reduce_max(heatmap) + 1e-10)
+
+    return heatmap.numpy()
+
+def draw_finding_marker(pil_img: Image.Image, cam: np.ndarray, color: tuple):
+    orig = np.array(pil_img.convert("RGB"))
+    H, W = orig.shape[:2]
+
+    cam_up = cv2.resize(cam, (W, H), interpolation=cv2.INTER_CUBIC)
+
+    heat_bgr = cv2.applyColorMap(
+        (cam_up * 255).astype(np.uint8),
+        cv2.COLORMAP_JET
+    )
+    heat_rgb = cv2.cvtColor(heat_bgr, cv2.COLOR_BGR2RGB)
+    blended = cv2.addWeighted(orig, 0.55, heat_rgb, 0.45, 0)
+
+    cy, cx = np.unravel_index(np.argmax(cam_up), cam_up.shape)
+    cx, cy = int(cx), int(cy)
+
+    active = (cam_up > 0.4).astype(np.uint8)
+    area = int(active.sum())
+    r_spread = max(22, int(np.sqrt(area / np.pi)))
+    r_dot = max(10, r_spread // 4)
+
+    WHITE = (255, 255, 255)
+
+    for i in range(30):
+        a0 = int(360 / 30 * i)
+        a1 = int(a0 + 7)
+        cv2.ellipse(
+            blended,
+            (cx, cy),
+            (r_spread, r_spread),
+            0,
+            a0,
+            a1,
+            color,
+            2,
+            cv2.LINE_AA,
+        )
+
+    cv2.circle(blended, (cx, cy), r_dot + 5, WHITE, 2, cv2.LINE_AA)
+    cv2.circle(blended, (cx, cy), r_dot, color, -1, cv2.LINE_AA)
+
+    hi = (
+        min(255, color[0] + 80),
+        min(255, color[1] + 80),
+        min(255, color[2] + 80),
+    )
+
+    cv2.circle(
+        blended,
+        (cx - r_dot // 4, cy - r_dot // 4),
+        max(2, r_dot // 3),
+        hi,
+        -1,
+        cv2.LINE_AA,
+    )
+
+    gap, ext = r_dot + 6, r_spread + 18
+    cv2.line(blended, (cx - ext, cy), (cx - gap, cy), color, 1, cv2.LINE_AA)
+    cv2.line(blended, (cx + gap, cy), (cx + ext, cy), color, 1, cv2.LINE_AA)
+    cv2.line(blended, (cx, cy - ext), (cx, cy - gap), color, 1, cv2.LINE_AA)
+    cv2.line(blended, (cx, cy + gap), (cx, cy + ext), color, 1, cv2.LINE_AA)
+
+    tag = "OPACITY"
+    font = cv2.FONT_HERSHEY_SIMPLEX
+    (tw, th), _ = cv2.getTextSize(tag, font, 0.48, 1)
+
+    tx = cx + r_spread + 8
+    ty = cy + th // 2
+
+    if tx + tw + 10 > W:
+        tx = cx - r_spread - tw - 12
+
+    cv2.rectangle(
+        blended,
+        (tx - 3, ty - th - 5),
+        (tx + tw + 7, ty + 5),
+        color,
+        -1,
+    )
+    cv2.putText(
+        blended,
+        tag,
+        (tx + 2, ty),
+        font,
+        0.48,
+        WHITE,
+        1,
+        cv2.LINE_AA,
+    )
+
+    qx = "Left" if cx < W * 0.5 else "Right"
+    qy = "Upper" if cy < H * 0.5 else "Lower"
+    region = f"{qx} {qy} lung field (x={cx}, y={cy})"
+
+    return Image.fromarray(blended), region
+
+# ─────────────────────────────────────────────────────────────
+# STATE
+# ─────────────────────────────────────────────────────────────
+def make_analysis_state(
+    label,
+    confidence,
+    region,
+    prob_str,
+    original_image=None,
+    result_image=None,
+):
+    return {
+        "label": label,
+        "confidence": float(confidence),
+        "region": region,
+        "probs": prob_str,
+        "original_image": original_image.copy() if original_image is not None else None,
+        "result_image": result_image.copy() if result_image is not None else None,
+    }
+
+# ─────────────────────────────────────────────────────────────
+# MAIN INFERENCE
+# ─────────────────────────────────────────────────────────────
+def analyze(pil_img: Image.Image):
+    if pil_img is None:
+        return (
+            None,
+            info_html("Awaiting scan input. Upload a chest X-ray and run ANALYZE."),
+            0.0,
+            "—",
+            None,
+            gr.update(visible=False),  # save_question
+            gr.update(visible=False),  # patient_form
+        )
+
+    try:
+        is_valid, reason = validate_chest_xray(pil_img)
+
+        if not is_valid:
+            return (
+                pil_img,
+                error_html(
+                    "INVALID INPUT — NOT A CHEST X-RAY",
+                    f"{reason if reason else 'This image does not appear to be a chest radiograph.'}"
+                    "<br>Please upload a frontal (PA) chest X-ray and re-run.",
+                ),
+                0.0,
+                "N/A",
+                None,
+                gr.update(visible=False),
+                gr.update(visible=False),
+            )
+
+        original = pil_img.convert("RGB").copy()
+
+        tensor = preprocess(original)
+        raw = model.predict(tensor, verbose=0)[0]
+
+        if IS_SIGMOID_BINARY:
+            p_pneumonia = float(raw[0])
+            probs = np.array(
+                [1.0 - p_pneumonia, p_pneumonia],
+                dtype=np.float32
+            )
+        else:
+            probs = np.asarray(raw, dtype=np.float32)
+
+        pred_idx = int(np.argmax(probs))
+        confidence = float(probs[pred_idx]) * 100
+        label = CLASS_NAMES[pred_idx]
+
+        prob_str = {
+            CLASS_NAMES[i]: f"{float(p):.3f}"
+            for i, p in enumerate(probs)
+        }
+
+        print(f"\n[Predict] {prob_str}")
+        print(
+            f"          → index {pred_idx} = '{label}' "
+            f"({confidence:.1f}%)"
+        )
+
+        if pred_idx == NORMAL_IDX:
+            out = original.copy()
+
+            d = ImageDraw.Draw(out)
+            txt = "CLEAR"
+            fnt = ImageFont.load_default()
+            bb = d.textbbox((0, 0), txt, font=fnt)
+            tw, th = bb[2] - bb[0], bb[3] - bb[1]
+            p = 8
+
+            d.rectangle(
+                [10, 10, 10 + tw + p * 2, 10 + th + p * 2],
+                fill=(61, 220, 132),
+                outline=(20, 140, 80),
+                width=2,
+            )
+            d.text(
+                (10 + p, 10 + p),
+                txt,
+                fill=(10, 12, 16),
+                font=fnt,
+            )
+
+            state = make_analysis_state(
+                "NORMAL",
+                confidence,
+                "N/A",
+                prob_str,
+                original,
+                out,
+            )
+
+            return (
+                out,
+                clear_html(confidence, prob_str),
+                round(confidence, 1),
+                "N/A",
+                state,
+                gr.update(visible=True),
+                gr.update(visible=False),
+            )
+
+        # PNEUMONIA → Grad-CAM + overlay
+        gradcam_target_idx = 0 if IS_SIGMOID_BINARY else pred_idx
+        cam = compute_gradcam(tensor, gradcam_target_idx)
+
+        annotated, region = draw_finding_marker(
+            original.copy(),
+            cam,
+            FINDING_COLOR_RGB,
+        )
+
+        state = make_analysis_state(
+            label,
+            confidence,
+            region,
+            prob_str,
+            original,
+            annotated,
+        )
+
+        return (
+            annotated,
+            finding_html(label, confidence, region, prob_str),
+            round(confidence, 1),
+            region,
+            state,
+            gr.update(visible=True),
+            gr.update(visible=False),
+        )
+
+    except Exception as e:
+        print(traceback.format_exc())
+
+        return (
+            pil_img,
+            error_html("ANALYSIS FAULT", str(e)),
+            0.0,
+            "Error",
+            None,
+            gr.update(visible=False),
+            gr.update(visible=False),
+        )
+
+# ─────────────────────────────────────────────────────────────
+# SUPABASE SAVE FUNCTIONS
+# ─────────────────────────────────────────────────────────────
+def pil_to_jpeg_bytes(image: Image.Image, quality=95):
+    buffer = io.BytesIO()
+    image.convert("RGB").save(
+        buffer,
+        format="JPEG",
+        quality=quality,
+        optimize=True,
+    )
+    return buffer.getvalue()
+
+def upload_image(bucket_name, path, image):
+    data = pil_to_jpeg_bytes(image)
+
+    response = (
+        supabase.storage
+        .from_(bucket_name)
+        .upload(
+            path=path,
+            file=data,
+            file_options={
+                "content-type": "image/jpeg",
+                "cache-control": "3600",
+                "upsert": "false",
+            },
+        )
+    )
+
+    return response
+
+def save_scan_to_supabase(
+    patient_name,
+    age,
+    sex,
+    remarks,
+    state,
+    patient_id,
+    emergency_level,
+    deterioration_choice,
+    spo2,
+    resp_rate,
+    heart_rate,
+):
+    # Basic validation
+    patient_name = (patient_name or "").strip()
+    remarks = (remarks or "").strip()
+    sex = (sex or "").strip()
+    patient_id = (patient_id or "").strip()
+
+    if not state:
+        return error_html(
+            "SAVE FAILED",
+            "There is no completed scan to save. Analyze a chest X-ray first.",
+        ), gr.update(visible=True), gr.update(visible=True)
+
+    if not patient_name:
+        return error_html(
+            "PATIENT NAME REQUIRED",
+            "Please enter the patient's name.",
+        ), gr.update(visible=True), gr.update(visible=True)
+
+    if age is None or str(age).strip() == "":
+        return error_html(
+            "AGE REQUIRED",
+            "Please enter the patient's age.",
+        ), gr.update(visible=True), gr.update(visible=True)
+
+    try:
+        age_int = int(age)
+    except Exception:
+        return error_html(
+            "INVALID AGE",
+            "Age must be a whole number.",
+        ), gr.update(visible=True), gr.update(visible=True)
+
+    if age_int < 0 or age_int > 120:
+        return error_html(
+            "INVALID AGE",
+            "Please enter an age between 0 and 120.",
+        ), gr.update(visible=True), gr.update(visible=True)
+
+    if sex not in {"Male", "Female", "Other", "Prefer not to say"}:
+        return error_html(
+            "SEX REQUIRED",
+            "Please select the patient's sex.",
+        ), gr.update(visible=True), gr.update(visible=True)
+
+    if emergency_level not in LEVEL_RANK:
+        emergency_level = "LOW"
+
+    original_image = state.get("original_image")
+    result_image = state.get("result_image")
+
+    if original_image is None or result_image is None:
+        return error_html(
+            "IMAGE DATA MISSING",
+            "The scan images are no longer available in this session. "
+            "Please analyze the X-ray again.",
+        ), gr.update(visible=True), gr.update(visible=True)
+
+    # ── Triage calculation ──────────────────────────────────
+    spo2_val = _opt_float(spo2)
+    rr_val = _opt_float(resp_rate)
+    hr_val = _opt_float(heart_rate)
+
+    if deterioration_choice in (None, "", "Auto-detect"):
+        previous_vitals = fetch_previous_vitals(patient_id) if patient_id else None
+        final_trend = determine_deterioration(
+            {"spo2": spo2_val, "rr": rr_val, "hr": hr_val}, previous_vitals
+        )
+    elif deterioration_choice in TREND_CHOICES:
+        final_trend = deterioration_choice
+    else:
+        final_trend = "UNKNOWN"
+
+    severity_score = compute_severity_score(spo2_val, rr_val, hr_val)
+    trend_rank = TREND_RANK.get(final_trend, 1)
+    priority_score = (
+        LEVEL_RANK.get(emergency_level, 1) * 1000
+        + (severity_score or 0.0) * 10
+        + trend_rank
+    )
+
+    now_iso = datetime.datetime.now(datetime.timezone.utc).isoformat()
+
+    scan_id = str(uuid.uuid4())
+
+    original_path = f"{scan_id}/original.jpg"
+    gradcam_path = f"{scan_id}/gradcam.jpg"
+
+    try:
+        # 1. Upload original X-ray
+        upload_image(
+            ORIGINAL_BUCKET,
+            original_path,
+            original_image,
+        )
+
+        # 2. Upload Grad-CAM/result image
+        upload_image(
+            GRADCAM_BUCKET,
+            gradcam_path,
+            result_image,
+        )
+
+        probs = state.get("probs", {})
+
+        normal_probability = float(probs.get("NORMAL", 0.0)) * 100
+        pneumonia_probability = float(probs.get("PNEUMONIA", 0.0)) * 100
+
+        # 3. Insert patient + inference record
+        record = {
+            "id": scan_id,
+            "patient_name": patient_name,
+            "age": age_int,
+            "sex": sex,
+            "remarks": remarks if remarks else None,
+            "prediction": state.get("label", "UNKNOWN"),
+            "confidence": float(state.get("confidence", 0.0)),
+            "region": state.get("region", "N/A"),
+            "normal_probability": normal_probability,
+            "pneumonia_probability": pneumonia_probability,
+            # These columns contain the PRIVATE Supabase Storage object paths.
+            "original_image_url": original_path,
+            "gradcam_image_url": gradcam_path,
+            # ── Triage fields ──
+            "patient_id": patient_id if patient_id else None,
+            "emergency_level": emergency_level,
+            "spo2": spo2_val,
+            "respiratory_rate": rr_val,
+            "heart_rate": hr_val,
+            "deterioration_status": final_trend,
+            "priority_score": round(priority_score, 2),
+            "triage_status": "WAITING",
+            "waiting_since": now_iso,
+        }
+
+        result = (
+            supabase
+            .table("patient_scans")
+            .insert(record)
+            .execute()
+        )
+
+        print(f"[ChestScan] Saved patient scan: {scan_id}")
+        print(f"[ChestScan] Database response: {result}")
+
+        vitals_line = " · ".join(
+            filter(
+                None,
+                [
+                    f"SpO₂ {spo2_val}%" if spo2_val is not None else None,
+                    f"RR {rr_val}/min" if rr_val is not None else None,
+                    f"HR {hr_val} bpm" if hr_val is not None else None,
+                ],
+            )
+        ) or "no vitals recorded"
+
+        return (
+            success_html(
+                "SCAN SAVED",
+                (
+                    f"Patient: {patient_name}<br>"
+                    f"Prediction: {state.get('label', 'UNKNOWN')}<br>"
+                    f"Confidence: {float(state.get('confidence', 0.0)):.1f}%<br>"
+                    f"{LEVEL_EMOJI.get(emergency_level,'⚪')} Emergency level: "
+                    f"<b style='color:{LEVEL_COLOR.get(emergency_level,'#c7cede')}'>{emergency_level}</b><br>"
+                    f"{TREND_EMOJI.get(final_trend,'❔')} Trend: {final_trend}<br>"
+                    f"Vitals: {vitals_line}<br>"
+                    f"Record ID: {scan_id}"
+                    f"<div style='margin-top:10px;font-size:11px;color:#6b5040'>{TRIAGE_DISCLAIMER}</div>"
+                ),
+            ),
+            gr.update(visible=False),
+            gr.update(visible=False),
+        )
+
+    except Exception as e:
+        print("[ChestScan] Supabase save failed:")
+        print(traceback.format_exc())
+
+        # Best-effort cleanup if DB insert/upload sequence failed.
+        try:
+            supabase.storage.from_(ORIGINAL_BUCKET).remove([original_path])
+        except Exception:
+            pass
+
+        try:
+            supabase.storage.from_(GRADCAM_BUCKET).remove([gradcam_path])
+        except Exception:
+            pass
+
+        return (
+            error_html(
+                "SUPABASE SAVE FAILED",
+                (
+                    "The patient record could not be saved.<br>"
+                    "If this is the first triage-enabled save, make sure you've "
+                    "run the ALTER TABLE migration for the new triage columns."
+                    "<br><br>"
+                    f"<small>{str(e)}</small>"
+                ),
+            ),
+            gr.update(visible=True),
+            gr.update(visible=True),
+        )
+
+def cancel_save():
+    return (
+        info_html(
+            "Scan not saved. You can analyze another X-ray or continue reviewing this result."
+        ),
+        gr.update(visible=False),  # save_question
+        gr.update(visible=False),  # patient_form
+    )
+
+def open_patient_form(state):
+    suggested = "LOW"
+    if state:
+        suggested = suggest_emergency_level(state.get("label"), state.get("confidence"), None)
+    return (
+        gr.update(visible=True),   # keep save_question/cancel visible
+        gr.update(visible=True),   # patient_form
+        gr.update(value=suggested),  # emergency_level suggestion
+        gr.update(value="Auto-detect"),  # deterioration dropdown reset
+    )
+
+# ─────────────────────────────────────────────────────────────
+# PATIENT HISTORY + TRIAGE QUEUE
+# ─────────────────────────────────────────────────────────────
+HISTORY_LIMIT = 10
+TRIAGE_LIMIT = 50
+
+# What counts as "needs a second look" in a remark — this is a simple
+# keyword heuristic, not clinical judgement. Tweak this list to fit how
+# your team actually writes remarks.
+FLAG_KEYWORDS = [
+    "urgent", "follow up", "follow-up", "followup", "refer", "referral",
+    "worsening", "worse", "readmit", "critical", "immediate", "asap",
+    "recheck", "repeat scan", "review needed",
+]
+
+def compute_scan_status(remarks):
+    """
+    Turns a free-text remark into a traffic-light status:
+      - no remarks at all        -> PENDING REVIEW (amber)
+      - remarks with a flag word -> FLAGGED (red)
+      - any other remarks        -> REVIEWED (green)
+    """
+    if not remarks or not str(remarks).strip():
+        return "PENDING REVIEW", "⏳", "#ffb020"
+
+    text = str(remarks).lower()
+    if any(word in text for word in FLAG_KEYWORDS):
+        return "FLAGGED", "🚩", ALERT_RED
+
+    return "REVIEWED", "✅", SAFE_GREEN
+
+def _get_signed_url(bucket_name, path, expires_in=600):
+    """Best-effort thumbnail URL. Buckets are private, so this needs a
+    signed URL; if it fails for any reason (missing file, policy, older
+    supabase-py version with a different return shape) we just skip the
+    thumbnail instead of breaking the whole history panel."""
+    if not path:
+        return None
+    try:
+        res = supabase.storage.from_(bucket_name).create_signed_url(path, expires_in)
+        if isinstance(res, dict):
+            return res.get("signedURL") or res.get("signedUrl") or res.get("signed_url")
+        return getattr(res, "signed_url", None)
+    except Exception as e:
+        print(f"[ChestScan] Could not sign URL for {bucket_name}/{path}: {e}")
+        return None
+
+def fetch_patient_history(limit=HISTORY_LIMIT):
+    """Pulls the most recent scans from Supabase. Tries to order by
+    created_at (the usual Supabase default timestamp column); if that
+    column doesn't exist on your table, falls back to unordered so the
+    panel still works rather than crashing."""
+    try:
+        query = (
+            supabase.table("patient_scans")
+            .select("*")
+            .order("created_at", desc=True)
+            .limit(limit)
+        )
+        result = query.execute()
+        return result.data or []
+    except Exception as e:
+        print(f"[ChestScan] Ordered history fetch failed ({e}); retrying without order.")
+        try:
+            result = (
+                supabase.table("patient_scans")
+                .select("*")
+                .limit(limit)
+                .execute()
+            )
+            return result.data or []
+        except Exception as e2:
+            print(f"[ChestScan] History fetch failed entirely: {e2}")
+            return None  # signals a hard failure vs. an empty table
+
+def fetch_triage_queue_records(limit=TRIAGE_LIMIT):
+    """Pulls patients still marked WAITING for the live triage queue. Falls
+    back gracefully if the triage_status column doesn't exist yet (pre-
+    migration) so the panel reports a clear error instead of hanging."""
+    try:
+        result = (
+            supabase.table("patient_scans")
+            .select("*")
+            .eq("triage_status", "WAITING")
+            .order("created_at", desc=True)
+            .limit(limit)
+            .execute()
+        )
+        return result.data or []
+    except Exception as e:
+        print(f"[ChestScan] Triage queue fetch failed ({e}); falling back to full table.")
+        try:
+            result = (
+                supabase.table("patient_scans")
+                .select("*")
+                .limit(limit)
+                .execute()
+            )
+            return result.data or []
+        except Exception as e2:
+            print(f"[ChestScan] Triage queue fallback fetch failed: {e2}")
+            return None
+
+def _triage_checklist_choices(records):
+    """Builds (label, value) choices for the "mark completed" checklist,
+    in the same priority order as the queue itself so ticking top-to-
+    bottom matches what's displayed on screen."""
+    if not records:
+        return []
+    ordered = sorted(records, key=compute_priority_key)
+    choices = []
+    for rec in ordered:
+        level = rec.get("emergency_level") or "LOW"
+        emoji = LEVEL_EMOJI.get(level, "⚪")
+        name = rec.get("patient_name", "Unknown")
+        rid = rec.get("id")
+        choices.append((f"{emoji} {name} — {level}", rid))
+    return choices
+
+
+def mark_patients_completed(selected_ids):
+    """Marks the ticked patients as no longer waiting (triage_status ->
+    DISCHARGED) so they drop out of the live queue. Only the ticked
+    records are touched — nothing else about them changes."""
+    if not selected_ids:
+        return gr.update(), gr.update()
+
+    failed = []
+    for rid in selected_ids:
+        try:
+            (
+                supabase.table("patient_scans")
+                .update({"triage_status": "DISCHARGED"})
+                .eq("id", rid)
+                .execute()
+            )
+        except Exception as e:
+            print(f"[ChestScan] Could not mark {rid} completed: {e}")
+            failed.append(rid)
+
+    records = fetch_triage_queue_records()
+    html = build_triage_queue_html(records)
+
+    if failed:
+        html = error_html(
+            "SOME UPDATES FAILED",
+            f"Could not mark {len(failed)} patient(s) as completed. "
+            "Check your connection and try again.",
+        ) + html
+
+    choices = _triage_checklist_choices(records) if records is not None else []
+    return html, gr.update(choices=choices, value=[])
+
+
+def _humanize_wait(ts_raw):
+    ts = _parse_ts(ts_raw)
+    now = datetime.datetime.now(datetime.timezone.utc)
+    seconds = max(0, (now - ts).total_seconds())
+    minutes = int(seconds // 60)
+    if minutes < 60:
+        return f"{minutes}m"
+    hours = minutes // 60
+    rem = minutes % 60
+    return f"{hours}h {rem}m"
+
+def build_history_html(records):
+    if records is None:
+        return error_html(
+            "COULD NOT LOAD HISTORY",
+            "Could not reach Supabase to fetch patient records. Check your "
+            "connection and SUPABASE_KEY, then try Refresh.",
+        )
+
+    if len(records) == 0:
+        return info_html("No saved patient scans yet. Analyze and save a scan to see it here.")
+
+    cards = ""
+    for rec in records:
+        status_text, status_icon, status_color = compute_scan_status(rec.get("remarks"))
+
+        pred = rec.get("prediction", "UNKNOWN")
+        pred_color = SAFE_GREEN if pred == "NORMAL" else ALERT_RED
+        conf = rec.get("confidence", 0.0) or 0.0
+        remarks = (rec.get("remarks") or "").strip()
+        ts = rec.get("created_at", "")
+
+        level = rec.get("emergency_level") or "—"
+        level_color = LEVEL_COLOR.get(level, "#6b7285")
+        level_emoji = LEVEL_EMOJI.get(level, "⚪")
+        trend = rec.get("deterioration_status") or "UNKNOWN"
+        trend_emoji = TREND_EMOJI.get(trend, "❔")
+        wait_str = _humanize_wait(rec.get("waiting_since") or rec.get("created_at"))
+        record_uid = str(rec.get("id", ""))[:8]
+        pid = rec.get("patient_id")
+
+        thumb_url = _get_signed_url(GRADCAM_BUCKET, rec.get("gradcam_image_url"))
+        thumb_html = (
+            f"<img src='{thumb_url}' style='width:56px;height:56px;object-fit:cover;"
+            f"border-radius:6px;border:1px solid {LINE};flex-shrink:0' />"
+            if thumb_url else
+            f"<div style='width:56px;height:56px;border-radius:6px;background:#101c2b;"
+            f"border:1px solid {LINE};flex-shrink:0;display:flex;align-items:center;"
+            f"justify-content:center;color:#3a4353;font-size:10px;text-align:center'>"
+            f"no<br>preview</div>"
+        )
+
+        cards += f"""
+        <div style='display:flex;gap:12px;align-items:center;padding:12px 14px;
+                    border:1px solid {LINE};border-left:3px solid {level_color};
+                    border-radius:8px;margin-bottom:8px;background:#0d1620'>
+          {thumb_html}
+          <div style='flex:1;min-width:0;font-family:"IBM Plex Mono",monospace'>
+            <div style='display:flex;align-items:center;gap:8px;flex-wrap:wrap'>
+              <span style='color:#e4e7ef;font-weight:700;font-size:13px'>
+                {rec.get('patient_name', 'Unknown')}
+              </span>
+              <span style='color:#6b7285;font-size:11px'>
+                {rec.get('age', '—')}y · {rec.get('sex', '—')}
+              </span>
+              <span style='color:#3a4353;font-size:10px'>
+                UID {record_uid}{f' · PID {pid}' if pid else ''}
+              </span>
+            </div>
+            <div style='display:flex;align-items:center;gap:8px;flex-wrap:wrap;margin-top:4px'>
+              <span style='color:{pred_color};font-size:11px;font-weight:700'>
+                {pred} ({conf:.1f}%)
+              </span>
+              <span style='color:{level_color};font-size:11px;font-weight:700'>
+                {level_emoji} {level}
+              </span>
+              <span style='color:#8a93a6;font-size:11px'>
+                {trend_emoji} {trend.title()}
+              </span>
+              <span style='color:#8a93a6;font-size:11px'>
+                ⏱ waiting {wait_str}
+              </span>
+            </div>
+            <div style='color:#6b7285;font-size:11px;margin-top:3px'>
+              {rec.get('region', 'N/A')} · {ts}
+            </div>
+            {f"<div style='color:#9aa4b0;font-size:11.5px;margin-top:4px'>“{remarks}”</div>" if remarks else ""}
+          </div>
+          <span style='background:{status_color}1f;color:{status_color};
+                       font-size:10.5px;padding:4px 10px;border-radius:20px;
+                       border:1px solid {status_color}55;white-space:nowrap;
+                       font-family:"IBM Plex Mono",monospace'>
+            {status_icon} {status_text}
+          </span>
+        </div>
+        """
+
+    return f"""
+    <div class='console-readout' style='padding:1rem 1rem 0.4rem'>
+      <div style='font-size:10px;color:#5a6178;margin-bottom:10px;
+                  text-transform:uppercase;letter-spacing:1.2px;
+                  font-family:"IBM Plex Mono",monospace'>
+        Last {len(records)} saved scan{'s' if len(records) != 1 else ''}
+      </div>
+      {cards}
+    </div>
+    """
+
+def build_triage_queue_html(records):
+    if records is None:
+        return error_html(
+            "COULD NOT LOAD TRIAGE QUEUE",
+            "Could not reach Supabase to fetch the queue. Check your "
+            "connection and SUPABASE_KEY, then try Refresh.",
+        )
+
+    if len(records) == 0:
+        return info_html("No patients currently waiting in the triage queue.")
+
+    ordered = sorted(records, key=compute_priority_key)
+
+    rows = ""
+    for i, rec in enumerate(ordered, start=1):
+        level = rec.get("emergency_level") or "LOW"
+        color = LEVEL_COLOR.get(level, "#7b8399")
+        emoji = LEVEL_EMOJI.get(level, "⚪")
+        trend = rec.get("deterioration_status") or "UNKNOWN"
+        trend_emoji = TREND_EMOJI.get(trend, "❔")
+
+        reasons = []
+        if rec.get("spo2") is not None:
+            reasons.append(f"SpO₂ {rec['spo2']}%")
+        if rec.get("respiratory_rate") is not None:
+            reasons.append(f"RR {rec['respiratory_rate']}/min")
+        if rec.get("heart_rate") is not None:
+            reasons.append(f"HR {rec['heart_rate']} bpm")
+        if trend != "UNKNOWN":
+            reasons.append(f"{trend_emoji} {trend.title()}")
+        reasons.append(f"waiting {_humanize_wait(rec.get('waiting_since') or rec.get('created_at'))}")
+        reason_str = " · ".join(reasons)
+
+        rows += f"""
+        <div style='display:flex;align-items:center;gap:12px;padding:10px 14px;
+                    border:1px solid {color}44;border-left:4px solid {color};
+                    border-radius:8px;margin-bottom:7px;background:#0d1620'>
+          <div style='font-family:"IBM Plex Mono",monospace;font-weight:700;
+                      color:{color};width:30px;text-align:center;font-size:14px'>
+            #{i}
+          </div>
+          <div style='flex:1;min-width:0;font-family:"IBM Plex Mono",monospace'>
+            <div>
+              <span style='color:#e4e7ef;font-weight:700'>{emoji} {rec.get('patient_name','Unknown')}</span>
+              <span style='color:{color};font-weight:700;margin-left:10px;font-size:11.5px'>{level}</span>
+            </div>
+            <div style='color:#8a93a6;font-size:11.5px;margin-top:3px'>{reason_str}</div>
+          </div>
+        </div>
+        """
+
+    return f"""
+    <div class='console-readout' style='padding:1rem 1rem 0.4rem'>
+      <div style='font-size:10px;color:#5a6178;margin-bottom:10px;text-transform:uppercase;
+                  letter-spacing:1.2px;font-family:"IBM Plex Mono",monospace'>
+        Live triage queue — {len(ordered)} patient{'s' if len(ordered) != 1 else ''} waiting
+      </div>
+      {rows}
+      <div style='margin-top:10px;font-size:11px;color:#6b5040;line-height:1.6'>
+        {TRIAGE_DISCLAIMER}
+      </div>
+    </div>
+    """
+
+# ─────────────────────────────────────────────────────────────
+# HTML HELPERS
+# ─────────────────────────────────────────────────────────────
+def _prob_rows(prob_str, highlight_idx=None):
+    rows = ""
+
+    for i, name in enumerate(CLASS_NAMES):
+        val = prob_str.get(name, "0.000")
+        pct = float(val) * 100
+
+        c = SAFE_GREEN if i == NORMAL_IDX else ALERT_RED
+        bold = (
+            "font-weight:700;"
+            if i == highlight_idx
+            else "opacity:0.75;"
+        )
+
+        rows += f"""
+        <div style='display:flex;align-items:center;gap:10px;margin:6px 0;{bold}
+                    font-family:"IBM Plex Mono",monospace'>
+          <span style='width:96px;font-size:11px;color:#7b8399;letter-spacing:0.3px'>
+            {name.upper()}
+          </span>
+          <div style='flex:1;background:#16202f;border-radius:2px;height:7px;
+                      overflow:hidden;border:1px solid rgba(255,255,255,0.05)'>
+            <div style='width:{pct:.1f}%;height:100%;background:{c};'></div>
+          </div>
+          <span style='width:52px;text-align:right;font-size:11px;color:#c7cede'>
+            {pct:5.1f}%
+          </span>
+        </div>
+        """
+
+    return rows
+
+def info_html(msg):
+    return (
+        f"<div class='console-readout' "
+        f"style='text-align:center;color:#5a6178;padding:2.2rem 1.5rem'>"
+        f"<div style='font-size:11px;letter-spacing:2px;color:{TEAL};"
+        f"margin-bottom:10px'>◇ STANDBY ◇</div>"
+        f"<div style='font-family:\"IBM Plex Mono\",monospace;font-size:13px'>"
+        f"{msg}</div></div>"
+    )
+
+def error_html(title, body):
+    return f"""
+    <div class='console-readout' style='border-color:{TEAL}55'>
+      <div style='color:{TEAL};font-weight:700;font-size:13px;letter-spacing:1px;
+                  margin-bottom:8px;font-family:"IBM Plex Mono",monospace'>
+        ⚠ {title}
+      </div>
+      <div style='color:#9aa4b0;font-size:13px;line-height:1.7'>
+        {body}
+      </div>
+    </div>
+    """
+
+def success_html(title, body):
+    return f"""
+    <div class='console-readout' style='border-color:{SAFE_GREEN}66'>
+      <div style='color:{SAFE_GREEN};font-weight:700;font-size:14px;
+                  letter-spacing:1px;margin-bottom:10px;
+                  font-family:"IBM Plex Mono",monospace'>
+        ✓ {title}
+      </div>
+      <div style='color:#9aa4b0;font-size:13px;line-height:1.8'>
+        {body}
+      </div>
+    </div>
+    """
+
+def finding_html(label, conf, region, prob_str):
+    color = ALERT_RED
+    ts = datetime.datetime.now().strftime("%H:%M:%S")
+
+    return f"""
+    <div class='console-readout' style='border-color:{color}66'>
+      <div style='display:flex;align-items:center;justify-content:space-between;
+                  margin-bottom:16px'>
+        <span style='color:{color};font-weight:700;font-size:15px;
+                     letter-spacing:0.5px;font-family:"IBM Plex Mono",monospace'>
+          &#9673; FINDING DETECTED
+        </span>
+        <span style='background:{color}1f;color:{color};font-size:11px;
+                     padding:4px 10px;border:1px solid {color}55;
+                     font-family:"IBM Plex Mono",monospace'>
+          {conf:.1f}% CONF
+        </span>
+      </div>
+
+      <table style='font-size:13px;border-collapse:collapse;width:100%;
+                    margin-bottom:16px;font-family:"IBM Plex Mono",monospace'>
+        <tr>
+          <td style='padding:4px 18px 4px 0;color:#6b7285;width:100px'>RESULT</td>
+          <td style='font-weight:700;color:{color};font-size:16px;
+                     letter-spacing:0.3px'>{label.upper()}</td>
+        </tr>
+        <tr>
+          <td style='padding:4px 18px 4px 0;color:#6b7285'>REGION</td>
+          <td style='color:#c7cede;font-size:12px'>{region}</td>
+        </tr>
+        <tr>
+          <td style='padding:4px 18px 4px 0;color:#6b7285'>TIMESTAMP</td>
+          <td style='color:#6b7285;font-size:12px'>{ts}</td>
+        </tr>
+      </table>
+
+      <div style='border-top:1px solid rgba(255,255,255,0.06);
+                  padding-top:12px'>
+        <div style='font-size:10px;color:#5a6178;margin-bottom:8px;
+                    text-transform:uppercase;letter-spacing:1.2px;
+                    font-family:"IBM Plex Mono",monospace'>
+          Class probabilities
+        </div>
+        {_prob_rows(prob_str, PNEUMO_IDX)}
+      </div>
+
+      <div style='margin-top:16px;font-size:11px;color:#6b5040;
+                  border-top:1px solid rgba(255,255,255,0.06);
+                  padding-top:10px;line-height:1.6'>
+        ⚠ Decision support only — not a diagnosis. Confirm with a qualified radiologist.
+      </div>
+    </div>
+    """
+
+def clear_html(conf, prob_str):
+    ts = datetime.datetime.now().strftime("%H:%M:%S")
+
+    return f"""
+    <div class='console-readout' style='border-color:{SAFE_GREEN}55'>
+      <div style='display:flex;align-items:center;justify-content:space-between;
+                  margin-bottom:16px'>
+        <span style='color:{SAFE_GREEN};font-weight:700;font-size:15px;
+                     letter-spacing:0.5px;font-family:"IBM Plex Mono",monospace'>
+          &#10003; NO FINDING
+        </span>
+        <span style='background:{SAFE_GREEN}1f;color:{SAFE_GREEN};
+                     font-size:11px;padding:4px 10px;
+                     border:1px solid {SAFE_GREEN}55;
+                     font-family:"IBM Plex Mono",monospace'>
+          {conf:.1f}% CONF
+        </span>
+      </div>
+
+      <div style='color:#7ba694;font-size:13px;margin-bottom:16px;
+                  font-family:"IBM Plex Mono",monospace'>
+        Scan classified as clear at {ts}.
+      </div>
+
+      <div style='border-top:1px solid rgba(255,255,255,0.06);
+                  padding-top:12px'>
+        <div style='font-size:10px;color:#5a6178;margin-bottom:8px;
+                    text-transform:uppercase;letter-spacing:1.2px;
+                    font-family:"IBM Plex Mono",monospace'>
+          Class probabilities
+        </div>
+        {_prob_rows(prob_str, NORMAL_IDX)}
+      </div>
+
+      <div style='margin-top:16px;font-size:11px;color:#3f4a52;
+                  border-top:1px solid rgba(255,255,255,0.06);
+                  padding-top:10px'>
+        Always confirm with a qualified radiologist.
+      </div>
+    </div>
+    """
+
+# ─────────────────────────────────────────────────────────────
+# ASSISTANT
+# ─────────────────────────────────────────────────────────────
+GREETING = (
+    "Upload a scan for an instant read, or ask me anything about "
+    "pneumonia and chest imaging."
+)
+
+SUGGESTED_PROMPTS = [
+    "What does this result mean?",
+    "What symptoms should I watch for?",
+    "How accurate is X-ray screening?",
+]
+
+SYSTEM_PROMPT_TEMPLATE = """You are the "Assistant" embedded inside ChestScan AI,
+a chest-radiograph pneumonia-screening console.
+
+Your ONLY job is to help the user understand:
+1) The specific prediction ChestScan just produced for their uploaded scan.
+2) General, educational information about pneumonia, chest X-rays, and
+   Grad-CAM / CNN-based classifiers.
+
+Current analysis context:
+{context_block}
+
+Rules:
+- If the user asks why a region is marked, explain it in terms of Grad-CAM activation.
+- You may explain lung anatomy and general educational chest X-ray information.
+- You are NOT a doctor and must not give a personal diagnosis, treatment plan,
+  or prognosis for a named patient.
+- Always note that a qualified radiologist/clinician must confirm any finding.
+- If unrelated to this scan or chest imaging, politely redirect.
+- Be concise, clear, and accurate.
+"""
+
+def _build_context_block(state):
+    if not state or not state.get("label"):
+        return "No scan has been analyzed yet in this session."
+
+    if state["label"] == "NORMAL":
+        return (
+            f"Prediction: NORMAL (no pneumonia finding)\n"
+            f"Confidence: {state['confidence']:.1f}%\n"
+            f"Full probabilities: {state['probs']}"
+        )
+
+    return (
+        f"Prediction: {state['label']} (finding detected)\n"
+        f"Confidence: {state['confidence']:.1f}%\n"
+        f"Marked location on scan: {state['region']}\n"
+        f"Full probabilities: {state['probs']}\n"
+        f"Note: the marked point is the pixel of maximum Grad-CAM activation "
+        f"from the final convolutional block ('{GRADCAM_LAYER}') for the "
+        f"predicted class."
+    )
+
+def chat_with_assistant(message, history, state):
+    if not message or not message.strip():
+        return history, ""
+
+    history = history or []
+
+    if not OPENROUTER_API_KEY:
+        history = history + [
+            {"role": "user", "content": message},
+            {
+                "role": "assistant",
+                "content": (
+                    "⚠️ OPENROUTER_API_KEY is not configured. "
+                    "Set it and restart the app."
+                ),
+            },
+        ]
+        return history, ""
+
+    context_block = _build_context_block(state)
+    system_prompt = SYSTEM_PROMPT_TEMPLATE.format(
+        context_block=context_block
+    )
+
+    api_messages = [
+        {"role": "system", "content": system_prompt}
+    ]
+
+    for turn in history[-8:]:
+        if turn.get("role") in ("user", "assistant"):
+            api_messages.append({
+                "role": turn["role"],
+                "content": turn["content"],
+            })
+
+    api_messages.append({
+        "role": "user",
+        "content": message,
+    })
+
+    try:
+        resp = requests.post(
+            OPENROUTER_URL,
+            headers={
+                "Authorization": f"Bearer {OPENROUTER_API_KEY}",
+                "Content-Type": "application/json",
+            },
+            data=json.dumps({
+                "model": OPENROUTER_MODEL,
+                "messages": api_messages,
+                "temperature": 0.4,
+                "max_tokens": 500,
+            }),
+            timeout=30,
+        )
+
+        resp.raise_for_status()
+        data = resp.json()
+        reply = data["choices"][0]["message"]["content"].strip()
+
+    except Exception as e:
+        reply = f"⚠️ Couldn't reach the explanation service ({e})."
+
+    history = history + [
+        {"role": "user", "content": message},
+        {"role": "assistant", "content": reply},
+    ]
+
+    return history, ""
+
+def use_suggested_prompt(prompt, history, state):
+    return chat_with_assistant(prompt, history, state)
+
+# ─────────────────────────────────────────────────────────────
+# GRADIO UI
+# ─────────────────────────────────────────────────────────────
+THEME = gr.themes.Base(
+    primary_hue="teal",
+    secondary_hue="cyan",
+    neutral_hue="slate",
+    font=[gr.themes.GoogleFont("IBM Plex Sans"), "sans-serif"],
+    font_mono=[gr.themes.GoogleFont("IBM Plex Mono"), "monospace"],
+).set(
+    body_background_fill=INK,
+    background_fill_primary=PANEL,
+    background_fill_secondary=INK,
+    border_color_primary=LINE,
+    block_background_fill=PANEL,
+    block_border_color=LINE,
+    block_label_text_color="#7b8399",
+    block_title_text_color="#e4e7ef",
+    body_text_color="#c7cede",
+    input_background_fill="#0d1620",
+    button_primary_background_fill=TEAL,
+    button_primary_text_color="#062420",
+    button_primary_background_fill_hover="#4ee9da",
+)
+
+CSS = f"""
+@import url('https://fonts.googleapis.com/css2?family=Space+Grotesk:wght@500;700&display=swap');
+
+.gradio-container {{ background: {INK} !important; }}
+
+#app-header {{
+    background: linear-gradient(180deg, #0f1b2b, #0a1420);
+    border: 1px solid {LINE};
+    border-radius: 8px;
+    padding: 1rem 1.6rem;
+    margin-bottom: 0.9rem;
+    display: flex;
+    align-items: center;
+    gap: 14px;
+}}
+
+#app-header .mark {{
+    width: 42px;
+    height: 42px;
+    border-radius: 10px;
+    background: {TEAL}1a;
+    border: 1px solid {TEAL}55;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    color: {TEAL};
+    font-size: 20px;
+    font-weight: 700;
+}}
+
+#app-header .title {{
+    font-family: 'Space Grotesk', sans-serif;
+    font-size: 20px;
+    font-weight: 700;
+    color: #f0f2f7;
+}}
+
+#app-header .subtitle {{
+    font-family: 'IBM Plex Sans', sans-serif;
+    font-size: 12.5px;
+    color: #6b7285;
+    margin-top: 2px;
+}}
+
+#app-header .badge {{
+    margin-left: auto;
+    font-family: 'IBM Plex Mono', monospace;
+    font-size: 11px;
+    color: {TEAL};
+    letter-spacing: 0.3px;
+    border: 1px solid {TEAL}55;
+    padding: 6px 14px;
+    border-radius: 20px;
+    background: {TEAL}12;
+}}
+
+.section-label {{
+    font-family: 'IBM Plex Sans', sans-serif;
+    font-weight: 600;
+    font-size: 14px;
+    color: #e4e7ef;
+    margin: 0.3rem 0 0.6rem 2px;
+}}
+
+.console-readout {{
+    background: #0d1620;
+    border: 1px solid {LINE};
+    border-radius: 8px;
+    padding: 1.4rem 1.6rem;
+}}
+
+#analyze-btn {{
+    font-weight: 600 !important;
+    border-radius: 8px !important;
+    height: 44px !important;
+}}
+
+.save-question {{
+    background: #0d1620;
+    border: 1px solid {LINE};
+    border-radius: 8px;
+    padding: 1rem;
+    margin-top: 1rem;
+}}
+
+.patient-form {{
+    background: #0d1620;
+    border: 1px solid {TEAL}44;
+    border-radius: 8px;
+    padding: 1rem;
+    margin-top: 1rem;
+}}
+
+.suggested-chip button {{
+    border-radius: 20px !important;
+    font-size: 12.5px !important;
+    border: 1px solid {LINE} !important;
+    background: #0f1b2b !important;
+    color: #c7cede !important;
+}}
+
+.history-toggle-btn button {{
+    border-radius: 20px !important;
+    font-size: 12px !important;
+    border: 1px solid {TEAL}55 !important;
+    background: {TEAL}12 !important;
+    color: {TEAL} !important;
+    width: auto !important;
+}}
+
+.triage-toggle-btn button {{
+    border-radius: 20px !important;
+    font-size: 12px !important;
+    border: 1px solid {ALERT_RED}55 !important;
+    background: {ALERT_RED}12 !important;
+    color: {ALERT_RED} !important;
+    width: auto !important;
+}}
+
+.history-panel {{
+    border: 1px solid {LINE};
+    border-radius: 8px;
+    margin-bottom: 0.9rem;
+    padding: 0.2rem 0.2rem 0.8rem;
+}}
+
+.footer-legend {{
+    background: #0d1620;
+    border: 1px solid {LINE};
+    border-radius: 8px;
+    padding: 1.2rem 1.6rem;
+    font-size: 12.5px;
+    color: #7b8399;
+    line-height: 2;
+}}
+"""
+
+def _header_html():
+    return f"""
+    <div id='app-header'>
+      <div class='mark'>∿</div>
+      <div>
+        <div class='title'>ChestScan AI</div>
+        <div class='subtitle'>
+          Pneumonia screening for chest radiographs · Emergency triage queue
+        </div>
+      </div>
+      <div class='badge'>✦ Decision support — not a diagnosis</div>
+    </div>
+    """
+
+# ─────────────────────────────────────────────────────────────
+# APP
+# ─────────────────────────────────────────────────────────────
+with gr.Blocks(title="ChestScan AI") as demo:
+
+    gr.HTML(_header_html())
+
+    with gr.Row(equal_height=True):
+
+        # LEFT: SCAN
+        with gr.Column(scale=1):
+            gr.HTML("<div class='section-label'>Scan viewer</div>")
+
+            with gr.Group():
+                inp = gr.Image(
+                    type="pil",
+                    label="Drop a chest X-ray here",
+                    height=340,
+                )
+
+            gr.HTML(
+                "<p style='font-size:11.5px;color:#4a5568;text-align:center;"
+                "margin-top:8px'>"
+                "PNG / JPG · frontal (PA) view gives the best read"
+                "</p>"
+            )
+
+            btn = gr.Button(
+                "▶ Analyze scan",
+                elem_id="analyze-btn",
+                size="lg",
+                variant="primary",
+            )
+
+            with gr.Row():
+                conf_box = gr.Number(
+                    label="Confidence %",
+                    interactive=False,
+                    value=0,
+                )
+
+                loc_box = gr.Textbox(
+                    label="Region",
+                    interactive=False,
+                    value="—",
+                )
+
+            out_img = gr.Image(
+                label="Result — heatmap + marker",
+                height=280,
+                interactive=False,
+            )
+
+            # Save question
+            with gr.Group(visible=False) as save_question:
+                gr.Markdown(
+                    "### Save this scan?\n"
+                    "Would you like to save this patient scan and analysis "
+                    "to the secure database?"
+                )
+
+                with gr.Row():
+                    yes_save_btn = gr.Button(
+                        "✓ Yes, save scan",
+                        variant="primary",
+                    )
+
+                    cancel_btn = gr.Button(
+                        "Cancel",
+                        variant="secondary",
+                    )
+
+            # Patient details
+            with gr.Group(
+                visible=False,
+                elem_classes=["patient-form"],
+            ) as patient_form:
+
+                gr.Markdown("### Patient Details")
+
+                patient_name = gr.Textbox(
+                    label="Patient Name",
+                    placeholder="Enter patient's name",
+                )
+
+                with gr.Row():
+                    patient_age = gr.Number(
+                        label="Age",
+                        minimum=0,
+                        maximum=120,
+                        precision=0,
+                        placeholder="Age",
+                    )
+
+                    patient_sex = gr.Dropdown(
+                        label="Sex",
+                        choices=[
+                            "Male",
+                            "Female",
+                            "Other",
+                            "Prefer not to say",
+                        ],
+                        value=None,
+                        allow_custom_value=False,
+                    )
+
+                patient_id = gr.Textbox(
+                    label="Patient ID / MRN (optional)",
+                    placeholder="Lets the queue detect worsening/improving trends across visits",
+                )
+
+                gr.HTML(
+                    "<div class='section-label' style='margin-top:14px'>"
+                    "🚨 Emergency Triage</div>"
+                )
+
+                with gr.Row():
+                    emergency_level = gr.Dropdown(
+                        label="Emergency level (AI-suggested — clinician may override)",
+                        choices=EMERGENCY_LEVELS,
+                        value="LOW",
+                    )
+
+                    deterioration_status_in = gr.Dropdown(
+                        label="Deterioration trend",
+                        choices=DETERIORATION_DROPDOWN_CHOICES,
+                        value="Auto-detect",
+                    )
+
+                gr.HTML(
+                    "<div style='font-size:11px;color:#6b7285;margin:10px 0 2px'>"
+                    "Vital signs (optional — leave blank if unavailable; "
+                    "nothing is ever assumed for a value you don't enter)</div>"
+                )
+
+                with gr.Row():
+                    spo2_in = gr.Number(
+                        label="SpO₂ (%)",
+                        minimum=0,
+                        maximum=100,
+                        precision=0,
+                    )
+                    rr_in = gr.Number(
+                        label="Resp. rate (breaths/min)",
+                        minimum=0,
+                        maximum=80,
+                        precision=0,
+                    )
+                    hr_in = gr.Number(
+                        label="Heart rate (bpm)",
+                        minimum=0,
+                        maximum=250,
+                        precision=0,
+                    )
+
+                recalc_btn = gr.Button(
+                    "🔄 Recalculate triage suggestion",
+                    size="sm",
+                )
+
+                patient_remarks = gr.Textbox(
+                    label="Remarks (optional)",
+                    placeholder="Enter doctor's remarks...",
+                    lines=3,
+                )
+
+                gr.HTML(
+                    f"<div style='font-size:11px;color:#6b5040;margin-top:6px;"
+                    f"line-height:1.6'>{TRIAGE_DISCLAIMER}</div>"
+                )
+
+                save_record_btn = gr.Button(
+                    "💾 Save Patient Record",
+                    variant="primary",
+                    size="lg",
+                )
+
+        # RIGHT: ASSISTANT
+        with gr.Column(scale=1):
+
+            gr.HTML("<div class='section-label'>Assistant</div>")
+
+            status = gr.HTML(info_html(GREETING))
+
+            # Chat state
+            analysis_state = gr.State(None)
+
+            # Full scan state used by saving
+            scan_state = gr.State(None)
+
+            assist_chat = gr.Chatbot(
+                label=None,
+                show_label=False,
+                height=380,
+                value=[
+                    {
+                        "role": "assistant",
+                        "content": GREETING,
+                    }
+                ],
+            )
+
+            with gr.Row():
+                assist_input = gr.Textbox(
+                    placeholder="Ask about the result...",
+                    show_label=False,
+                    scale=5,
+                    container=False,
+                )
+
+                assist_send = gr.Button(
+                    "➤",
+                    variant="primary",
+                    scale=1,
+                )
+
+            with gr.Row():
+                for p in SUGGESTED_PROMPTS:
+                    chip = gr.Button(
+                        p,
+                        elem_classes=["suggested-chip"],
+                        size="sm",
+                    )
+
+                    # Route the chip's output back into the real chat box and
+                    # the real input box (not a disconnected throwaway widget),
+                    # otherwise clicking a chip never clears the input field.
+                    chip.click(
+                        fn=use_suggested_prompt,
+                        inputs=[
+                            gr.State(p),
+                            assist_chat,
+                            analysis_state,
+                        ],
+                        outputs=[
+                            assist_chat,
+                            assist_input,
+                        ],
+                    )
+
+    # ─────────────────────────────────────────────────────────
+    # ANALYZE
+    # ─────────────────────────────────────────────────────────
+    # Keep chat state synchronized with scan state
+    def extract_chat_state(state):
+        if not state:
+            return None
+        return {
+            "label": state.get("label"),
+            "confidence": state.get("confidence"),
+            "region": state.get("region"),
+            "probs": state.get("probs"),
+        }
+
+    # Chained with .then() rather than a second independent .click() so
+    # analysis_state is always derived from the scan_state analyze() just
+    # produced, instead of racing it.
+    btn.click(
+        fn=analyze,
+        inputs=[inp],
+        outputs=[
+            out_img,
+            status,
+            conf_box,
+            loc_box,
+            scan_state,
+            save_question,
+            patient_form,
+        ],
+    ).then(
+        fn=extract_chat_state,
+        inputs=[scan_state],
+        outputs=[analysis_state],
+    )
+
+    # ─────────────────────────────────────────────────────────
+    # YES → SHOW PATIENT FORM (with AI-suggested triage level)
+    # ─────────────────────────────────────────────────────────
+    yes_save_btn.click(
+        fn=open_patient_form,
+        inputs=[scan_state],
+        outputs=[save_question, patient_form, emergency_level, deterioration_status_in],
+    )
+
+    recalc_btn.click(
+        fn=recalc_suggestion,
+        inputs=[scan_state, spo2_in, rr_in, hr_in, patient_id],
+        outputs=[emergency_level, deterioration_status_in],
+    )
+
+    # ─────────────────────────────────────────────────────────
+    # CANCEL
+    # ─────────────────────────────────────────────────────────
+    cancel_btn.click(
+        fn=cancel_save,
+        inputs=[],
+        outputs=[
+            status,
+            save_question,
+            patient_form,
+        ],
+    )
+
+    # ─────────────────────────────────────────────────────────
+    # SAVE PATIENT RECORD
+    # ─────────────────────────────────────────────────────────
+    save_event = save_record_btn.click(
+        fn=save_scan_to_supabase,
+        inputs=[
+            patient_name,
+            patient_age,
+            patient_sex,
+            patient_remarks,
+            scan_state,
+            patient_id,
+            emergency_level,
+            deterioration_status_in,
+            spo2_in,
+            rr_in,
+            hr_in,
+        ],
+        outputs=[
+            status,
+            patient_form,
+            save_question,
+        ],
+    )
+
+    # ─────────────────────────────────────────────────────────
+    # PATIENT HISTORY + LIVE TRIAGE QUEUE
+    #
+    # Fix for the "opens and just spins forever" bug: each panel now opens
+    # in two steps — (1) become visible immediately with an explicit
+    # "loading" message so the click always feels responsive, then (2) a
+    # chained .then() does the actual Supabase fetch and fills in the real
+    # content. A Refresh button lets you retry without closing the panel,
+    # and a failed fetch now renders a clear error instead of an endless
+    # spinner.
+    # ─────────────────────────────────────────────────────────
+    def _load_history_content():
+        return build_history_html(fetch_patient_history())
+
+    def _load_triage_content():
+        records = fetch_triage_queue_records()
+        html = build_triage_queue_html(records)
+        choices = _triage_checklist_choices(records) if records is not None else []
+        return html, gr.update(choices=choices, value=[])
+
+    with gr.Row():
+        history_btn = gr.Button(
+            "📋 Patient history",
+            elem_classes=["history-toggle-btn"],
+            size="sm",
+        )
+        triage_btn = gr.Button(
+            "🚨 Triage queue",
+            elem_classes=["triage-toggle-btn"],
+            size="sm",
+        )
+
+    with gr.Group(visible=False, elem_classes=["history-panel"]) as history_panel:
+        history_content = gr.HTML()
+        with gr.Row():
+            refresh_history_btn = gr.Button("⟳ Refresh", elem_classes=["suggested-chip"], size="sm")
+            close_history_btn = gr.Button("✕ Close", elem_classes=["suggested-chip"], size="sm")
+
+    with gr.Group(visible=False, elem_classes=["history-panel"]) as triage_panel:
+        triage_content = gr.HTML()
+        triage_checklist = gr.CheckboxGroup(
+            label="Mark treated patients as completed (removes them from the waiting queue)",
+            choices=[],
+            value=[],
+        )
+        with gr.Row():
+            mark_completed_btn = gr.Button(
+                "✅ Mark selected as completed",
+                variant="primary",
+                size="sm",
+            )
+            refresh_triage_btn = gr.Button("⟳ Refresh", elem_classes=["suggested-chip"], size="sm")
+            close_triage_btn = gr.Button("✕ Close", elem_classes=["suggested-chip"], size="sm")
+
+    history_btn.click(
+        fn=lambda: (gr.update(visible=True), info_html("⏳ Fetching latest patient records…")),
+        inputs=[],
+        outputs=[history_panel, history_content],
+    ).then(
+        fn=_load_history_content,
+        inputs=[],
+        outputs=[history_content],
+    )
+
+    refresh_history_btn.click(
+        fn=lambda: info_html("⏳ Refreshing…"),
+        inputs=[],
+        outputs=[history_content],
+    ).then(
+        fn=_load_history_content,
+        inputs=[],
+        outputs=[history_content],
+    )
+
+    close_history_btn.click(
+        fn=lambda: gr.update(visible=False),
+        inputs=[],
+        outputs=[history_panel],
+    )
+
+    triage_btn.click(
+        fn=lambda: (
+            gr.update(visible=True),
+            info_html("⏳ Building live triage queue…"),
+            gr.update(choices=[], value=[]),
+        ),
+        inputs=[],
+        outputs=[triage_panel, triage_content, triage_checklist],
+    ).then(
+        fn=_load_triage_content,
+        inputs=[],
+        outputs=[triage_content, triage_checklist],
+    )
+
+    refresh_triage_btn.click(
+        fn=lambda: (info_html("⏳ Refreshing…"), gr.update()),
+        inputs=[],
+        outputs=[triage_content, triage_checklist],
+    ).then(
+        fn=_load_triage_content,
+        inputs=[],
+        outputs=[triage_content, triage_checklist],
+    )
+
+    mark_completed_btn.click(
+        fn=mark_patients_completed,
+        inputs=[triage_checklist],
+        outputs=[triage_content, triage_checklist],
+    ).then(
+        fn=_load_history_content,
+        inputs=[],
+        outputs=[history_content],
+    )
+
+    close_triage_btn.click(
+        fn=lambda: gr.update(visible=False),
+        inputs=[],
+        outputs=[triage_panel],
+    )
+
+    # Keep both panels fresh right after a save (only updates the HTML —
+    # doesn't force either panel open).
+    save_event.then(
+        fn=_load_history_content,
+        inputs=[],
+        outputs=[history_content],
+    ).then(
+        fn=_load_triage_content,
+        inputs=[],
+        outputs=[triage_content, triage_checklist],
+    )
+
+    # ─────────────────────────────────────────────────────────
+    # ASSISTANT CHAT
+    # ─────────────────────────────────────────────────────────
+    assist_send.click(
+        fn=chat_with_assistant,
+        inputs=[
+            assist_input,
+            assist_chat,
+            analysis_state,
+        ],
+        outputs=[
+            assist_chat,
+            assist_input,
+        ],
+    )
+
+    assist_input.submit(
+        fn=chat_with_assistant,
+        inputs=[
+            assist_input,
+            assist_chat,
+            analysis_state,
+        ],
+        outputs=[
+            assist_chat,
+            assist_input,
+        ],
+    )
+
+    # LEGEND
+
+    with gr.Accordion("📖 Legend & how it works", open=False):
+        gr.HTML(
+            f"""
+            <div class='footer-legend'>
+              <b style='color:#c7cede'>RESULT TYPES</b><br>
+              &nbsp;
+              <span style='color:{ALERT_RED}'>&#9679;</span>
+              Pneumonia (finding)
+              &nbsp;&nbsp;
+              <span style='color:{SAFE_GREEN}'>&#10003;</span>
+              Normal (clear)<br><br>
+
+              <b style='color:#c7cede'>OVERLAY MARKER</b><br>
+              &nbsp; Solid dot = Grad-CAM hottest point<br>
+              &nbsp; Dashed ring = activation spread area<br>
+              &nbsp; Crosshair = predicted location on scan<br><br>
+
+              <b style='color:#c7cede'>EMERGENCY TRIAGE</b><br>
+              &nbsp; {LEVEL_EMOJI['CRITICAL']} CRITICAL &nbsp;
+              {LEVEL_EMOJI['HIGH']} HIGH &nbsp;
+              {LEVEL_EMOJI['MODERATE']} MODERATE &nbsp;
+              {LEVEL_EMOJI['LOW']} LOW<br>
+              &nbsp; Within the same level, patients are ordered by available
+              vitals (SpO₂ / respiratory rate / heart rate), then by whether
+              their condition is trending {TREND_EMOJI['WORSENING']} worse,
+              then by how long they've been waiting, then FIFO.<br>
+              &nbsp; {TRIAGE_DISCLAIMER}<br><br>
+
+              <b style='color:#c7cede'>PIPELINE</b><br>
+              &nbsp; Uploads are first checked by a vision model to confirm
+              they're an actual frontal chest X-ray.<br>
+              &nbsp; Valid scans are resized to
+              {INPUT_SIZE}×{INPUT_SIZE} and normalized with DenseNet121
+              preprocessing.<br>
+              &nbsp; Grad-CAM is computed from the final convolutional block
+              ('{GRADCAM_LAYER}') to localize the region driving the prediction.<br><br>
+
+              <span style='color:#6b5040'>
+                ⚠ Decision support only — not a diagnostic tool.
+                Always confirm results with a qualified radiologist.
+              </span>
+            </div>
+            """
+        )
+
+
+# LAUNCH
+if __name__ == "__main__":
+    demo.launch(
+        server_name="0.0.0.0",
+        server_port=7860,
+        share=False,
+        inbrowser=True,
+        theme=THEME,
+        css=CSS,
+        max_file_size="10mb",
+    )
